@@ -9,6 +9,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.activation import (
     _act_mul_and_dynamic_mxfp4_quant_kernel,
     _act_mul_and_dynamic_fp8_group_quant_kernel,
+    _silu_and_mul_kernel,
 )
 
 _LOGGER = AiterTritonLogger()
@@ -198,3 +199,42 @@ def act_mul_and_fp8_group_quant(
     )
 
     return x_fp8, out_bs
+
+
+def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    """SiLU + Mul activation, written to a pre-allocated output tensor.
+
+    Computes ``out = silu(x[..., :H]) * x[..., H:]`` where ``H = x.shape[-1] // 2``.
+
+    Signature mirrors :func:`aiter.silu_and_mul` (the HIP kernel) so callers
+    can dispatch by architecture without changing call sites. Useful as a
+    portable fallback on architectures where the HIP kernel does not compile
+    (e.g. RDNA4 / gfx1201).
+
+    Args:
+        out: Pre-allocated tensor, shape ``(M, H)``, dtype matches x.
+        x:   Input tensor, shape ``(M, 2*H)``. Last dim must be even.
+    """
+    _LOGGER.info(f"SILU_AND_MUL: x={tuple(x.shape)}")
+    assert x.is_cuda and out.is_cuda
+    assert x.dim() == 2 and out.dim() == 2, "silu_and_mul expects 2D tensors"
+    M, full = x.shape
+    assert full % 2 == 0, "x last dim must be even"
+    half = full // 2
+    assert out.shape == (
+        M,
+        half,
+    ), f"out shape must be ({M}, {half}); got {tuple(out.shape)}"
+
+    BLOCK_SIZE_N = min(1024, max(16, triton.next_power_of_2(half)))
+    grid = (M, triton.cdiv(half, BLOCK_SIZE_N))
+    _silu_and_mul_kernel[grid](
+        x,
+        out,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        half,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+    )

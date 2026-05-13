@@ -42,6 +42,37 @@ def _relu(x):
     return tl.maximum(0.0, x)
 
 
+@triton.jit
+def _silu_and_mul_kernel(
+    x_ptr,
+    out_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_out_m,
+    stride_out_n,
+    HALF_N,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Per-row out = silu(x[..., :HALF_N]) * x[..., HALF_N:].
+
+    Iterates over N in BLOCK_SIZE_N chunks so HALF_N can be arbitrary
+    (does not need to be a power of two). Provided as a portable
+    fallback for architectures where the HIP `silu_and_mul` kernel is
+    unavailable (e.g. RDNA4 / gfx1201, whose ISA lacks `v_pk_mul_f32`).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1) * BLOCK_SIZE_N
+    cols = pid_n + tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < HALF_N
+    a_offs = pid_m * stride_x_m + cols * stride_x_n
+    b_offs = pid_m * stride_x_m + (HALF_N + cols) * stride_x_n
+    a = tl.load(x_ptr + a_offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(x_ptr + b_offs, mask=mask, other=0.0).to(tl.float32)
+    out = (_silu(a) * b).to(out_ptr.dtype.element_ty)
+    out_offs = pid_m * stride_out_m + cols * stride_out_n
+    tl.store(out_ptr + out_offs, out, mask=mask)
+
+
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
