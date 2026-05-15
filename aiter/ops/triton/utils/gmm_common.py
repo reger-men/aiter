@@ -88,7 +88,7 @@ def str_from_group_sizes_dtype(dtype: torch.dtype) -> str:
 
 
 # Default data type, as string.
-GROUP_SIZES_DTYPE_STR: str = "int64"
+GROUP_SIZES_DTYPE_STR: str = "int32"
 assert (
     GROUP_SIZES_DTYPE_STR in SUPPORTED_GROUP_SIZES_DTYPES_STR
 ), "Default string data type isn't in set of supported string data types."
