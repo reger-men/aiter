@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
 import triton
+import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a8w8_per_token_scale_repr = make_kernel_repr(
     "_gemm_a8w8_per_token_scale_kernel",
@@ -18,19 +21,7 @@ _gemm_a8w8_per_token_scale_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
-    ],
-)
-
-
-_gemm_a8w8_per_token_scale_reduce_repr = make_kernel_repr(
-    "_gemm_a8w8_per_token_scale_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
     ],
 )
 
@@ -38,8 +29,6 @@ _gemm_a8w8_per_token_scale_reduce_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a8w8_per_token_scale_repr)
@@ -77,7 +66,6 @@ def _gemm_a8w8_per_token_scale_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -119,7 +107,8 @@ def _gemm_a8w8_per_token_scale_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        grid_mn = num_pid_m * num_pid_n
+        remap_xcd(pid, grid_mn)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -168,7 +157,7 @@ def _gemm_a8w8_per_token_scale_kernel(
                 )
 
             # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b, input_precision="ieee")
+            accumulator += tl.dot(a, b)
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -185,66 +174,10 @@ def _gemm_a8w8_per_token_scale_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-@triton.jit(repr=_gemm_a8w8_per_token_scale_reduce_repr)
-def _gemm_a8w8_per_token_scale_reduce_kernel(
-    c_in_ptr,
-    c_out_ptr,
-    M,
-    N,
-    stride_c_in_k,
-    stride_c_in_m,
-    stride_c_in_n,
-    stride_c_out_m,
-    stride_c_out_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    ACTUAL_KSPLIT: tl.constexpr,
-    MAX_KSPLIT: tl.constexpr,
-):
-
-    tl.assume(stride_c_in_k > 0)
-    tl.assume(stride_c_in_m > 0)
-    tl.assume(stride_c_in_n > 0)
-    tl.assume(stride_c_out_m > 0)
-    tl.assume(stride_c_out_n > 0)
-
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
-
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, MAX_KSPLIT)
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
-        + (offs_m[None, :, None] * stride_c_in_m)
-        + (offs_n[None, None, :] * stride_c_in_n)
-    )
-
-    if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = tl.load(c_in_ptrs)
-    else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
-    c = tl.sum(c, axis=0)
-
-    c = c.to(c_out_ptr.type.element_ty)
-
-    c_out_ptrs = (
-        c_out_ptr
-        + (offs_m[:, None] * stride_c_out_m)
-        + (offs_n[None, :] * stride_c_out_n)
-    )
-
-    tl.store(c_out_ptrs, c)
 
 
 def _get_config(

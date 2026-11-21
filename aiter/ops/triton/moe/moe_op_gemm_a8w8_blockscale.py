@@ -2,13 +2,16 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8_blockscale import (
     _moe_gemm_a8w8_blockscale,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -69,7 +72,7 @@ def get_kernel_config(m, n, k, routing_data):
     blockscale_m = 128
     blockscale_k = 128
     blockscale_n = 128
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
@@ -78,7 +81,7 @@ def get_kernel_config(m, n, k, routing_data):
     if block_m == 16:
         block_n = 256
         block_k = 128
-        num_warps = 4
+        num_warps = 8
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
@@ -136,7 +139,7 @@ def moe_gemm_a8w8_blockscale(
     apply_swiglu=False,
     alpha=1.0,
     limit=None,
-    add_residual=True,
+    swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
     per_row_x_scale=False,
@@ -253,7 +256,7 @@ def moe_gemm_a8w8_blockscale(
         alpha,
         limit,
         reduction_n_matmul,
-        add_residual,
+        swiglu_add_residual,
         routing_data.n_expts_act,
         config["block_m"],
         config["block_n"],
@@ -290,7 +293,7 @@ def moe_gemm_a8w8_blockscale(
         limit,
         reduction_n_reduction,
         out_dtype=out_dtype,
-        add_residual=add_residual,
+        swiglu_add_residual=swiglu_add_residual,
     )
     return y_final
 
@@ -339,7 +342,7 @@ def moe_gemm_torch(
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
-        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32)
+        off = torch.zeros(sizes.shape[0] + 1, dtype=torch.int32, device=x.device)
         off[1:] = torch.cumsum(sizes, 0)
         offs = list(itertools.pairwise(off))
     else:
@@ -352,6 +355,7 @@ def moe_gemm_torch(
         if gather_indx is None:
             idx = torch.arange(lo, hi, device=x.device)
         else:
+            gather_indx = gather_indx.to(torch.int32)
             idx = gather_indx[lo:hi] // n_expts_act
         out = torch.matmul(x[idx, :].float(), w[i].float())
         if bias is not None:
@@ -364,6 +368,7 @@ def moe_gemm_torch(
     if scatter_indx is None:
         return y
     # accumulate output from all experts
+    scatter_indx = scatter_indx.to(torch.int32)
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
     src_idx = scatter_indx.view(-1, n_expts_act)

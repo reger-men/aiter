@@ -24,23 +24,25 @@ Usage:
     GPU_ARCHS=gfx942 python op_tests/test_gemm_codegen.py
 """
 
+import contextlib
 import os
 import sys
 import tempfile
 import textwrap
+from unittest.mock import patch
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 # Import arch constants directly from build_targets — no torch dependency.
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
-from build_targets import (  # noqa: E402
-    GFX_CU_NUM_MAP,
+import pandas as pd
+from build_targets import (
+    GFX_CU_NUMS_MAP,
     filter_tune_df,
     get_build_targets_env,
+    target_num_xcds,
 )
-
-import pandas as pd  # noqa: E402
 
 REPRO_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -53,12 +55,14 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
     "gemm_codegen_gfx_filter_bpreshuffle.csv",
 )
 
-# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
+# GPU targets used throughout this test.  cu_num values match GFX_CU_NUMS_MAP
 # in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) — update
 # here if that mapping changes.
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
+TARGETS_GFX942 = [TARGET_A, ("gfx942", 228), TARGET_C]
+TARGETS_GFX950 = [TARGET_B, ("gfx950", 128)]
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -98,10 +102,12 @@ def test_get_build_targets():
     orig_cu = os.environ.pop("CU_NUM", None)
 
     try:
-        # 1.1 Single known arch
+        # 1.1 Single known arch expands to every listed CU count
         os.environ["GPU_ARCHS"] = TARGET_A[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_A[0]} → [{TARGET_A}]", t == [TARGET_A], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_A[0]} → {TARGETS_GFX942}", t == TARGETS_GFX942, str(t)
+        )
 
         # 1.2 CU_NUM override (MI308X: gfx942 but cu_num=80)
         os.environ["GPU_ARCHS"] = TARGET_C[0]
@@ -117,14 +123,16 @@ def test_get_build_targets():
         # 1.3 Second known arch
         os.environ["GPU_ARCHS"] = TARGET_B[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_B[0]} → [{TARGET_B}]", t == [TARGET_B], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_B[0]} → {TARGETS_GFX950}", t == TARGETS_GFX950, str(t)
+        )
 
         # 1.4 Multi-arch (semicolon-separated)
         os.environ["GPU_ARCHS"] = f"{TARGET_A[0]};{TARGET_B[0]}"
         t = get_build_targets_env()
         _check(
-            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → two targets",
-            t == [TARGET_A, TARGET_B],
+            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → every listed pair of both",
+            t == [*TARGETS_GFX942, *TARGETS_GFX950],
             str(t),
         )
 
@@ -146,11 +154,21 @@ def test_get_build_targets():
             raised = True
         _check("GPU_ARCHS=' ; ' → RuntimeError", raised)
 
-        # 1.7 GFX_CU_NUM_MAP covers at least the two known production targets
-        _check(
-            "GFX_CU_NUM_MAP contains gfx942 and gfx950",
-            "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
-        )
+        # 1.7 GFX_CU_NUMS_MAP lists every fixture target, full GPU first
+        for gfx, cu_num in (TARGET_A, TARGET_B, TARGET_C):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num}",
+                cu_num in cu_nums,
+                str(cu_nums),
+            )
+        for gfx, cu_num in (TARGET_A, TARGET_B):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num} first",
+                cu_nums[:1] == (cu_num,),
+                str(cu_nums),
+            )
 
         # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
@@ -244,7 +262,17 @@ def test_gen_instances_filter(
         f"multi={n_multi}, {gfx_a}/{cu_a}={n_a}, {gfx_b}/{cu_b}={n_b}",
     )
 
-    # 2.6 All MNK shapes in the repro CSV have different kernelIds across gfx targets
+    # 2.6 Expanding an arch to its listed CU counts keeps every row of that arch
+    arch_targets = [(gfx_a, cu_num) for cu_num in GFX_CU_NUMS_MAP[gfx_a]]
+    filtered = filter_tune_df(df, arch_targets)
+    expected = df[df["gfx"] == gfx_a]
+    _check(
+        f"{pfx}{gfx_a}/listed cu_nums filter keeps every {gfx_a} row",
+        filtered.index.equals(expected.index),
+        f"rows={len(filtered)}, cu_num={sorted(filtered['cu_num'].unique().tolist())}",
+    )
+
+    # 2.7 All MNK shapes in the repro CSV have different kernelIds across gfx targets
     grp = df.groupby(["M", "N", "K"])["kernelId"].nunique()
     shapes_with_diff = grp[grp > 1]
     _check(
@@ -253,7 +281,7 @@ def test_gen_instances_filter(
         f"shapes with diverging kernelIds: {len(shapes_with_diff)}/{len(grp)}",
     )
 
-    # 2.7 Contamination: the two targets share MNK shapes with different kernelIds
+    # 2.8 Contamination: the two targets share MNK shapes with different kernelIds
     d_a = filter_tune_df(df, [target_a]).set_index(["M", "N", "K"])
     d_b = filter_tune_df(df, [target_b]).set_index(["M", "N", "K"])
     common = d_a.index.intersection(d_b.index)
@@ -280,7 +308,8 @@ def test_gen_instances_filter(
 
 
 def _make_temp_csv(content: str) -> str:
-    f = tempfile.NamedTemporaryFile(
+    # delete=False on purpose: the path outlives the handle.
+    f = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".csv", delete=False, prefix="test_gemm_codegen_"
     )
     f.write(textwrap.dedent(content).strip() + "\n")
@@ -292,9 +321,9 @@ def test_runtime_dispatch_key():
     _section("4. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
 
     try:
-        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
         import aiter.ops.gemm_op_a8w8 as _mod
-    except Exception as e:
+        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print(f"  SKIP  could not import get_CKGEMM_config ({e})")
         return
 
@@ -302,11 +331,11 @@ def test_runtime_dispatch_key():
     # via rocminfo — GPU_ARCHS is intentionally ignored at runtime.  Derive the
     # test CSV rows from the actual live GPU so the test is correct on any runner.
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  runtime dispatch tests require a live GPU ({e})")
         return
 
@@ -354,8 +383,8 @@ def test_runtime_dispatch_key():
             cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {cu_num},128,1280,8192,7,0,10.0,old_kernel,100.0,500.0,0.0
         """)
-        import logging
         import io
+        import logging
 
         buf = io.StringIO()
         handler = logging.StreamHandler(buf)
@@ -383,8 +412,301 @@ def test_runtime_dispatch_key():
             if path:
                 try:
                     os.unlink(path)
-                except Exception:
+                except Exception:  # noqa: BLE001,S110
                     pass
+
+
+def test_write_name_keyed_lookup_header():
+    _section("5. write_name_keyed_lookup_header — name-keyed C++ key format")
+
+    from chip_info import write_name_keyed_lookup_header
+
+    class _FakeKernel:
+        def __init__(self, name):
+            self.name = name
+
+    # Two distinct shapes mapping to the same kernel name + a different kernel
+    # exercise the dedup logic.  The negative-int default_dict entry must be
+    # skipped (it's a heuristic the dispatch references by symbol, not via
+    # the registry).
+    k_a = _FakeKernel("a8w8_blockscale_kernel_alpha")
+    k_b = _FakeKernel("a8w8_blockscale_kernel_beta")
+    k_default = _FakeKernel("default_heuristic")
+    kernels_dict = {
+        ("gfx942", 304, 128, 4096, 4096): k_a,
+        ("gfx942", 304, 256, 4096, 4096): k_a,  # duplicate name → must dedupe
+        ("gfx942", 304, 512, 4096, 4096): k_b,
+        -1: k_default,  # default_dict entry — must be skipped
+    }
+
+    LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
+    LOOKUP_template = '   {{"{kernel_name}", {kernel_name}<DTYPE, ETYPE>}},\\\n'
+    LOOKUP_end = "}\n#endif\n"
+
+    path = None
+    try:
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )
+        path = f.name
+        f.close()
+        write_name_keyed_lookup_header(
+            path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
+        )
+        with open(path) as f:
+            content = f.read()
+
+        _check(
+            "name-keyed: kernel alpha is registered with quoted string key",
+            '{"a8w8_blockscale_kernel_alpha", a8w8_blockscale_kernel_alpha<DTYPE, ETYPE>}'
+            in content,
+            f"not found in output:\n{content}",
+        )
+        _check(
+            "name-keyed: kernel beta is registered with quoted string key",
+            '{"a8w8_blockscale_kernel_beta", a8w8_blockscale_kernel_beta<DTYPE, ETYPE>}'
+            in content,
+            f"not found in output:\n{content}",
+        )
+        _check(
+            "name-keyed: kernel alpha is deduped (registered exactly once)",
+            content.count('"a8w8_blockscale_kernel_alpha"') == 1,
+            f"alpha appears {content.count('a8w8_blockscale_kernel_alpha')} times "
+            f"in output:\n{content}",
+        )
+        _check(
+            "name-keyed: default_dict (-1) entry is skipped",
+            "default_heuristic" not in content,
+            f"default_heuristic unexpectedly in output:\n{content}",
+        )
+        _check(
+            "name-keyed: no tuple-style C++ keys leak through",
+            '{"gfx942", 304' not in content and "{304" not in content,
+            f"tuple-style key found in output:\n{content}",
+        )
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:  # noqa: BLE001,S110
+                pass
+
+
+def test_blockscale_kernel_name_forwarding():
+    _section("6. Python -> C++ kernelName forwarding for blockscale GEMM")
+
+    try:
+        import aiter.ops.gemm_op_a8w8 as a8w8_mod
+        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+    except Exception as e:  # noqa: BLE001
+        print(f"  SKIP  could not import gemm_op_a8w8 ({e})")
+        return
+
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+
+        gfx = get_gfx_runtime()
+        cu_num = get_cu_num()
+    except Exception as e:  # noqa: BLE001
+        print(f"  SKIP  forwarding tests require a live GPU for gfx detection ({e})")
+        return
+
+    # Stub torch.empty so we don't allocate device memory; the recorded calls
+    # below short-circuit before any kernel actually runs.
+    try:
+        import torch
+    except Exception as e:  # noqa: BLE001
+        print(f"  SKIP  torch unavailable ({e})")
+        return
+
+    csv_paths = []
+    saved = {
+        "ck": a8w8_mod.gemm_a8w8_blockscale_ck,
+        "cktile": a8w8_mod.gemm_a8w8_blockscale_cktile,
+        "cache": dict(a8w8_mod._CKGEMM_CONFIG_CACHE),
+        "has_gfx": dict(a8w8_mod._CKGEMM_HAS_GFX),
+    }
+    record = {}
+
+    def fake_ck(*args, **kwargs):
+        record["libtype"] = "ck"
+        record["kwargs"] = dict(kwargs)
+        return args[4]  # Y
+
+    def fake_cktile(*args, **kwargs):
+        record["libtype"] = "cktile"
+        record["kwargs"] = dict(kwargs)
+        return args[4]  # Y
+
+    AITER_CONFIGS = a8w8_mod.AITER_CONFIGS
+
+    @contextlib.contextmanager
+    def _override_blockscale_csv(csv_path):
+        """Temporarily replace AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE with a
+        property that returns ``csv_path``.  The attribute is a @property on
+        the AITER_CONFIG class with no setter, so we swap the descriptor on
+        the class itself and restore it on exit.
+        """
+        cls = type(AITER_CONFIGS)
+        saved = cls.__dict__["AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE"]
+        cls.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = property(
+            lambda self, _p=csv_path: _p
+        )
+        try:
+            yield
+        finally:
+            cls.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = saved
+
+    try:
+        a8w8_mod.gemm_a8w8_blockscale_ck = fake_ck
+        a8w8_mod.gemm_a8w8_blockscale_cktile = fake_cktile
+
+        m, n, k = 32, 128, 256
+
+        # 6.1 ck row → kernelName forwarded to gemm_a8w8_blockscale_ck
+        csv_ck = _make_temp_csv(f"""
+            gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
+            {gfx},{cu_num},{m},{n},{k},0,ck,2,10.0,my_tuned_ck_kernel,100.0,500.0,0.0
+        """)
+        csv_paths.append(csv_ck)
+        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+        a8w8_mod._CKGEMM_HAS_GFX = {}
+        get_CKGEMM_config.cache_clear()
+
+        cfg = get_CKGEMM_config(m, n, k, tuned_file=csv_ck)
+        _check(
+            "ck CSV: get_CKGEMM_config returns kernelName from CSV",
+            cfg is not None and cfg.get("kernelName") == "my_tuned_ck_kernel",
+            f"cfg={cfg}",
+        )
+
+        XQ = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="cpu")
+        WQ = torch.empty(n, k, dtype=torch.float8_e4m3fn, device="cpu")
+        x_scale = torch.empty(m, k // 128, dtype=torch.float32, device="cpu")
+        w_scale = torch.empty(
+            (n + 127) // 128, k // 128, dtype=torch.float32, device="cpu"
+        )
+
+        with _override_blockscale_csv(csv_ck):
+            record.clear()
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+
+            _check(
+                "ck CSV: gemm_a8w8_blockscale dispatched to gemm_a8w8_blockscale_ck",
+                record.get("libtype") == "ck",
+                f"recorded libtype={record.get('libtype')}",
+            )
+            _check(
+                "ck CSV: kernelName='my_tuned_ck_kernel' forwarded to C++ wrapper",
+                record.get("kwargs", {}).get("kernelName") == "my_tuned_ck_kernel",
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+            _check(
+                "ck CSV: splitK=2 forwarded alongside kernelName",
+                record.get("kwargs", {}).get("splitK") == 2,
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+
+            # 6.2 Edit the CSV in place to a different kernelName, clear caches,
+            # confirm the new name flows through (the staleness scenario this
+            # whole refactor is designed to fix).
+            with open(csv_ck, "w") as f:
+                f.write(
+                    "gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,"
+                    "tflops,bw,errRatio\n"
+                    f"{gfx},{cu_num},{m},{n},{k},0,ck,3,10.0,"
+                    "my_other_ck_kernel,100.0,500.0,0.0\n"
+                )
+            a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+            a8w8_mod._CKGEMM_HAS_GFX = {}
+            get_CKGEMM_config.cache_clear()
+            record.clear()
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+
+            _check(
+                "edited CSV: new kernelName='my_other_ck_kernel' forwarded "
+                "without rebuild",
+                record.get("kwargs", {}).get("kernelName") == "my_other_ck_kernel",
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+            _check(
+                "edited CSV: new splitK=3 reflected too",
+                record.get("kwargs", {}).get("splitK") == 3,
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+
+        # 6.3 cktile row → routed to gemm_a8w8_blockscale_cktile with kernelName
+        csv_cktile = _make_temp_csv(f"""
+            gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
+            {gfx},{cu_num},{m},{n},{k},0,cktile,1,10.0,my_tuned_tile_kernel,100.0,500.0,0.0
+        """)
+        csv_paths.append(csv_cktile)
+        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+        a8w8_mod._CKGEMM_HAS_GFX = {}
+        get_CKGEMM_config.cache_clear()
+        with _override_blockscale_csv(csv_cktile):
+            record.clear()
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+            _check(
+                "cktile CSV: gemm_a8w8_blockscale routed to gemm_a8w8_blockscale_cktile",
+                record.get("libtype") == "cktile",
+                f"recorded libtype={record.get('libtype')}",
+            )
+            _check(
+                "cktile CSV: kernelName='my_tuned_tile_kernel' forwarded",
+                record.get("kwargs", {}).get("kernelName") == "my_tuned_tile_kernel",
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+
+        # 6.4 No tuned row for the shape → kernelName="" forwarded (default
+        # heuristic kicks in inside C++).  This guards the empty-name fallback
+        # path that's intentionally distinct from the wrong-name hard error.
+        csv_empty = _make_temp_csv(
+            "gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,"
+            "tflops,bw,errRatio\n"
+        )
+        csv_paths.append(csv_empty)
+        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+        a8w8_mod._CKGEMM_HAS_GFX = {}
+        get_CKGEMM_config.cache_clear()
+        with _override_blockscale_csv(csv_empty):
+            record.clear()
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+            # With no row matched, the dispatcher hits the "no config" fallback,
+            # which calls gemm_a8w8_blockscale_ck without kernelName= — Python's
+            # default kwarg ("") then propagates to C++.
+            _check(
+                "no tuned row: still routed to gemm_a8w8_blockscale_ck (default path)",
+                record.get("libtype") == "ck",
+                f"recorded libtype={record.get('libtype')}",
+            )
+            _check(
+                "no tuned row: kernelName not explicitly set "
+                "(C++ sees default empty string)",
+                "kernelName" not in record.get("kwargs", {}),
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+
+    finally:
+        a8w8_mod.gemm_a8w8_blockscale_ck = saved["ck"]
+        a8w8_mod.gemm_a8w8_blockscale_cktile = saved["cktile"]
+        a8w8_mod._CKGEMM_CONFIG_CACHE = saved["cache"]
+        a8w8_mod._CKGEMM_HAS_GFX = saved["has_gfx"]
+        get_CKGEMM_config.cache_clear()
+        for p in csv_paths:
+            try:
+                os.unlink(p)
+            except Exception:  # noqa: BLE001,S110
+                pass
 
 
 def test_write_lookup_header():
@@ -393,28 +715,49 @@ def test_write_lookup_header():
     from chip_info import write_lookup_header
 
     class _FakeKernel:
-        def __init__(self, name):
+        def __init__(self, name, supports_m_padding=True, supports_k_padding=True):
             self.name = name
+            self.supports_m_padding = supports_m_padding
+            self.supports_k_padding = supports_k_padding
 
     kernels_dict = {
         ("gfx942", 304, 128, 4096, 4096): _FakeKernel("kernel_non_batched"),
-        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel("kernel_batched"),
+        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel(
+            "kernel_batched",
+            supports_m_padding=False,
+            supports_k_padding=False,
+        ),
         -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
-    LOOKUP_template = "   {{{MNK}, {kernel_name}<DTYPE, ETYPE>}},\\\n"
+    LOOKUP_template = (
+        "   {{{MNK}, {{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}, "
+        "{supports_k_padding}}}}},\\\n"
+    )
     LOOKUP_end = "}\n#endif\n"
 
     path = None
     try:
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )
         path = f.name
         f.close()
         write_lookup_header(
-            path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
+            path,
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            extra_format_args=lambda kernel: {
+                "supports_m_padding": str(kernel.supports_m_padding).lower(),
+                "supports_k_padding": str(kernel.supports_k_padding).lower(),
+            },
         )
-        content = open(path).read()
+        with open(path) as fh:
+            content = fh.read()
 
         _check(
             "non-batched key: gfx string quoted in C++ initializer",
@@ -432,6 +775,11 @@ def test_write_lookup_header():
             f"default_kernel unexpectedly in output:\n{content}",
         )
         _check(
+            "per-kernel metadata is emitted in the lookup value",
+            "{kernel_batched<DTYPE, ETYPE>, false, false}" in content,
+            f"padding metadata not found in output:\n{content}",
+        )
+        _check(
             "old-style key without gfx (regression guard): {304, 128, ...} absent",
             "{304, 128, 4096, 4096}" not in content,
             f"old-style key found in output:\n{content}",
@@ -440,8 +788,203 @@ def test_write_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
+
+
+def test_build_tune_dict_strict_unknown_kernel():
+    _section("7. build_tune_dict — strict-fail on stale tuned-CSV rows")
+
+    from chip_info import build_tune_dict, build_tune_dict_batched
+
+    class _FakeKernel:
+        def __init__(self, name):
+            self.name = name
+
+    gfx, cu_num = TARGET_B  # ("gfx950", 256)
+
+    # Pin the build target so filter_tune_df keeps our synthetic rows.
+    orig_archs = os.environ.pop("GPU_ARCHS", None)
+    orig_cu = os.environ.pop("CU_NUM", None)
+    os.environ["GPU_ARCHS"] = gfx
+    os.environ["CU_NUM"] = str(cu_num)
+
+    try:
+        # 7.1 kernelName path: one good row + one row referencing an unknown name.
+        kA = _FakeKernel("real_kernel_a")
+        kernels_by_name = {"real_kernel_a": kA}
+        kernels_list = {0: kA}
+        default_dict = {-1: _FakeKernel("default_heuristic")}
+        df = pd.DataFrame(
+            [
+                {
+                    "gfx": gfx,
+                    "cu_num": cu_num,
+                    "M": 32,
+                    "N": 128,
+                    "K": 256,
+                    "kernelId": 0,
+                    "libtype": "cktile",
+                    "kernelName": "real_kernel_a",
+                },
+                {
+                    "gfx": gfx,
+                    "cu_num": cu_num,
+                    "M": 64,
+                    "N": 128,
+                    "K": 256,
+                    "kernelId": 0,
+                    "libtype": "cktile",
+                    "kernelName": "ghost_kernel_b",
+                },
+            ]
+        )
+        raised = None
+        try:
+            build_tune_dict(
+                df,
+                default_dict,
+                kernels_list,
+                libtype="cktile",
+                kernels_by_name=kernels_by_name,
+            )
+        except RuntimeError as e:
+            raised = e
+        _check(
+            "kernelName path: build_tune_dict raises RuntimeError on unknown name",
+            raised is not None,
+        )
+        _check(
+            "kernelName path: error message names the offending kernelName",
+            raised is not None and "ghost_kernel_b" in str(raised),
+            f"err={raised}",
+        )
+        _check(
+            "kernelName path: error message names the offending shape (M=64,N=128,K=256)",
+            raised is not None
+            and "M=64" in str(raised)
+            and "N=128" in str(raised)
+            and "K=256" in str(raised),
+            f"err={raised}",
+        )
+        _check(
+            "kernelName path: known-good kernel name is NOT in error message",
+            raised is not None and "real_kernel_a" not in str(raised),
+            f"err={raised}",
+        )
+
+        # 7.2 kernelName path: all rows good → returns dict, no raise.
+        df_good = df.iloc[[0]].reset_index(drop=True)
+        td = build_tune_dict(
+            df_good,
+            default_dict,
+            kernels_list,
+            libtype="cktile",
+            kernels_by_name=kernels_by_name,
+        )
+        _check(
+            "kernelName path: good-only CSV returns dict with the expected key",
+            (gfx, cu_num, 32, 128, 256) in td and td[(gfx, cu_num, 32, 128, 256)] is kA,
+            f"td.keys={list(td.keys())}",
+        )
+        _check(
+            "kernelName path: default_dict entries pass through",
+            -1 in td,
+            f"td.keys={list(td.keys())}",
+        )
+
+        # 7.3 kernelId fallback path: CSV has no kernelName column → uses kernelId.
+        df_id = pd.DataFrame(
+            [
+                {
+                    "gfx": gfx,
+                    "cu_num": cu_num,
+                    "M": 32,
+                    "N": 128,
+                    "K": 256,
+                    "kernelId": 0,
+                    "libtype": "ck",
+                },
+                {
+                    "gfx": gfx,
+                    "cu_num": cu_num,
+                    "M": 64,
+                    "N": 128,
+                    "K": 256,
+                    "kernelId": 999,
+                    "libtype": "ck",
+                },
+            ]
+        )
+        raised = None
+        try:
+            build_tune_dict(df_id, default_dict, kernels_list, libtype="ck")
+        except RuntimeError as e:
+            raised = e
+        _check(
+            "kernelId path: build_tune_dict raises RuntimeError on unknown id",
+            raised is not None,
+        )
+        _check(
+            "kernelId path: error message names the offending kernelId=999",
+            raised is not None and "999" in str(raised),
+            f"err={raised}",
+        )
+
+        # 7.4 build_tune_dict_batched also fails strictly.
+        df_b = pd.DataFrame(
+            [
+                {
+                    "gfx": gfx,
+                    "cu_num": cu_num,
+                    "B": 4,
+                    "M": 32,
+                    "N": 128,
+                    "K": 256,
+                    "kernelId": 999,
+                }
+            ]
+        )
+        raised = None
+        try:
+            build_tune_dict_batched(df_b, default_dict, kernels_list)
+        except RuntimeError as e:
+            raised = e
+        _check(
+            "batched: build_tune_dict_batched raises on unknown kernelId",
+            raised is not None and "999" in str(raised) and "B=4" in str(raised),
+            f"err={raised}",
+        )
+
+    finally:
+        if orig_archs is not None:
+            os.environ["GPU_ARCHS"] = orig_archs
+        elif "GPU_ARCHS" in os.environ:
+            del os.environ["GPU_ARCHS"]
+        if orig_cu is not None:
+            os.environ["CU_NUM"] = orig_cu
+        elif "CU_NUM" in os.environ:
+            del os.environ["CU_NUM"]
+
+
+def test_target_num_xcds():
+    _section("8. target_num_xcds() — die count per SKU")
+    for cu_override in ("128", "256"):
+        with patch.dict(os.environ, GPU_ARCHS="gfx950", CU_NUM=cu_override):
+            for gfx, cu_num, expected in [
+                ("gfx950", 128, 4),
+                ("gfx950", 256, 8),
+                ("gfx942", 80, 4),
+                ("gfx942", 228, 6),
+                ("gfx942", 304, 8),
+                ("gfx1250", 256, 8),
+            ]:
+                actual = target_num_xcds(gfx, cu_num)
+                _check(
+                    f"{gfx}/{cu_num} has {expected} XCDs with CU_NUM={cu_override}",
+                    actual == expected,
+                    f"got {actual}",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +1006,11 @@ if __name__ == "__main__":
         label="module_gemm_a8w8_bpreshuffle",
     )
     test_write_lookup_header()
+    test_write_name_keyed_lookup_header()
     test_runtime_dispatch_key()
+    test_blockscale_kernel_name_forwarding()
+    test_build_tune_dict_strict_unknown_kernel()
+    test_target_num_xcds()
 
     print(f"\n{'='*60}")
     print(f"  Results: {_passed} passed, {_failed} failed")

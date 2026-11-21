@@ -9,6 +9,7 @@
 #include "fmha_bwd.hpp"
 #endif
 #include <functional>
+#include <memory>
 #include <variant>
 
 namespace aiter {
@@ -147,11 +148,26 @@ struct mha_bwd_args
     // until aiter::mha_bwd returns. If zero_init is true the bytes must be zero
     // by the time the kernel reads them.
     std::function<void*(size_t bytes, bool zero_init)> workspace_alloc{};
+
+    // Per-call pinned (page-locked) host buffer allocator. Returned shared_ptr
+    // owns the underlying host allocation and is type-erased so the caller can
+    // back it with PyTorch's CachingHostAllocator (pin_memory=true), raw
+    // hipHostMalloc/hipHostFree, or a custom pool. The pointer accessed via
+    // .get() must remain valid (not reused by the allocator) for as long as any
+    // pending stream operation references it; aiter ensures this by extending
+    // shared_ptr lifetime via a stream-tail hipLaunchHostFunc keepalive.
+    // Required for the group-mode async pipeline; mha_bwd returns an error if
+    // left empty in group mode. Unused in batch mode (may be left empty).
+    std::function<std::shared_ptr<void>(size_t bytes)> pinned_host_alloc{};
+
+    // gfx1250 deterministic only: number of private dq_acc planes, 0 picks it from the shape.
+    // Kept last so positional initialisers of the fields above stay valid.
+    uint32_t det_split = 0;
 };
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
 {
-    void* ptr_dq; // 0x00: dq or dq_acc
+    void* ptr_dq; // 0x00: dq or dq_acc; the gfx942 hdim_q 192 kernels write dq with q's strides
     p2 _p0;
     void* ptr_dk; // 0x10
     p2 _p1;
@@ -174,6 +190,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     float log2e; // 0xa0
     p3 _p10;
     unsigned int seqlen_q; // 0xb0: s_seq_len_q
+                           //       group mode, gfx942 hdim_q 192 kernels: max_seqlen_q
     p3 _p11;
     unsigned int Ts; // 0xc0: s_Seqs_k*sub_K
     p3 _p12;
@@ -194,6 +211,7 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     unsigned int Seqs_dk; // 0x140: s_Seqs_dk
     p3 _p20;
     unsigned int seqlen_k; // 0x150: batch mode
+                           //        group mode, gfx942 hdim_q 192 kernels: max_seqlen_k
     p3 _p21;
     unsigned int head_dim_q; // 0x160: batch&group mode for headdim padding
     p3 _p22;
@@ -241,11 +259,17 @@ struct __attribute__((packed)) fmha_bwd_dqdkdv_args
     p2 _p40;
     unsigned int
         max_seqlen_dq; // 0x290: gorup mode max seqlen q for a16 dq_acc store, padding to 16x
+                       //        gfx1250: dq_acc rows in one head plane, read in group mode
     p3 _p41;
     int mask_x; // 0x2a0
     p3 _p42;
     int mask_y; // 0x2b0
     p3 _p43;
+    // Everything from here on is gfx1250 only; the other archs' kernels end at 0x2c0.
+    unsigned int nsplit; // 0x2c0: deterministic only, number of private dq_acc planes
+    p3 _p44;
+    unsigned int split_stride; // 0x2d0: deterministic only, bytes between dq_acc planes
+    p3 _p45;
 };
 
 struct __attribute__((packed)) fmha_bwd_odo_args
@@ -285,22 +309,24 @@ struct __attribute__((packed)) fmha_bwd_odo_args
 };
 
 // dq_shuffle & dq_convert post process kernel args
+// The head/batch strides are 64-bit because gfx1250 loads them as such, and gfx950 the dq_acc
+// ones; the other archs read the low 32 bits.
 struct __attribute__((packed)) fmha_bwd_post_kernel_args
 {
     void* ptr_dq_acc;
     p2 _p0;
     void* ptr_dq;
     p2 _p1;
-    unsigned int Hs_dq_acc;
-    p3 _p2;
-    unsigned int BAs_dq_acc;
-    p3 _p3;
+    uint64_t Hs_dq_acc;
+    p2 _p2;
+    uint64_t BAs_dq_acc;
+    p2 _p3;
     unsigned int Seqs_dq_acc;
     p3 _p4;
-    unsigned int Hs_dq;
-    p3 _p5;
-    unsigned int BAs_dq;
-    p3 _p6;
+    uint64_t Hs_dq;
+    p2 _p5;
+    uint64_t BAs_dq;
+    p2 _p6;
     unsigned int Seqs_dq;
     p3 _p7;
     unsigned int seqlen_q;
@@ -311,6 +337,13 @@ struct __attribute__((packed)) fmha_bwd_post_kernel_args
     p2 _p10;
     const void* ptr_qseq_padded;
     p2 _p11;
+    // Everything from here on is gfx1250 only; the other archs' kernels end at 0xc0.
+    unsigned int max_seqlen_dq; // 0xc0: batch mode only
+    p3 _p12;
+    unsigned int nsplit; // 0xd0: deterministic only, number of dq_acc planes to fold
+    p3 _p13;
+    unsigned int split_stride; // 0xe0: deterministic only, bytes between dq_acc planes
+    p3 _p14;
 };
 
 __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args, const ck_tile::stream_config&);

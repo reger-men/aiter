@@ -15,7 +15,7 @@ concurrency:
 env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
-  BASE_IMAGE: rocm/vllm-dev:nightly@sha256:76968f79a118de308324483885aa6482e86d42db3f83a8c908cf293b7e3e497e
+  BASE_IMAGE: rocm/vllm-dev:nightly
   DOCKER_PULL_MAX_ATTEMPTS: "3"
   DOCKER_PULL_RETRY_DELAY_SECONDS: "10"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-whl-${{ github.run_id }}
@@ -23,6 +23,14 @@ env:
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
   check-signal:
     if: >-
       github.event_name != 'pull_request' ||
@@ -47,7 +55,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: check-signal
+    needs: [check-signal, ci_config]
     runs-on: build-only-aiter
     steps:
       - name: Checkout aiter repo
@@ -65,10 +73,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -88,6 +97,7 @@ jobs:
             --network=host \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
+            -e AITER_USE_SYSTEM_TRITON=1 \
             ${{ env.BASE_IMAGE }} \
             bash -lc '
               set -euo pipefail
@@ -97,7 +107,6 @@ jobs:
               pip uninstall -y aiter amd-aiter || true
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
               pip install -r requirements.txt
               pip install --upgrade pandas pyzmq einops numpy==1.26.2
               pip install --upgrade "pybind11>=3.0.1"
@@ -116,34 +125,60 @@ jobs:
           retention-days: 14
 
   vllm_benchmark:
-    name: vLLM Benchmark (8 GPU)
+    name: vLLM Benchmark
     timeout-minutes: 60
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: build_aiter_wheel
-    runs-on: linux-aiter-mi300x-8
+    needs: [build_aiter_wheel, ci_config]
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
-          - model: openai/gpt-oss-120b
+          - model: deepseek-ai/DeepSeek-V4-Pro
+            runner: linux-aiter-do-mi350x-dpx-8
             kv_cache_dtype: fp8_kvcache
             tp: 8
-            extra_args: --gpu-memory-utilization 0.3
-            extra_env_args: ""
-          - model: deepseek-ai/DeepSeek-R1-0528
+            extra_args: >-
+              --quantization deepseek_v4_fp8
+              --moe-backend aiter
+              --tokenizer-mode deepseek_v4
+              --reasoning-parser deepseek_v4
+              --max-model-len 1024
+              --max-num-batched-tokens 1024
+              --gpu-memory-utilization 0.954
+              --enforce-eager
+              --disable-custom-all-reduce
+              --enable-expert-parallel
+            extra_env_args: -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-dpx-8
+            kv_cache_dtype: default_kvcache
+            tp: 4
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
+          - model: amd/MiniMax-M3-MXFP4
+            runner: linux-aiter-do-mi350x-dpx-8
             kv_cache_dtype: default_kvcache
             tp: 8
-            extra_args: --block-size 1
-            extra_env_args: ""
-          - model: moonshotai/Kimi-K2.5
-            kv_cache_dtype: default_kvcache
-            tp: 8
-            extra_args: --block-size 1 --trust-remote-code
-            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
+            extra_args: >-
+              --block-size 128
+              --attention-backend TRITON_ATTN
+              --reasoning-parser minimax_m3
+              --moe-backend aiter
+              --max-model-len 4096
+              --max-num-batched-tokens 8192
+              --gpu-memory-utilization 0.80
+              --enforce-eager
+            extra_env_args: -e VLLM_ROCM_USE_AITER_MOE=1 -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
         
     steps:
       - name: Checkout Docker pull retry helper
@@ -156,6 +191,7 @@ jobs:
 
       - name: Download Aiter wheel artifact
         uses: actions/download-artifact@v4
+        timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
@@ -163,10 +199,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi
@@ -203,12 +240,19 @@ jobs:
             fi
           fi
 
-          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            GPU_FLAG="$(cat /etc/podinfo/gha-render-devices)"
+          else
+            GPU_FLAG="--device=/dev/kfd --device=/dev/dri --group-add video"
+          fi
+
+          docker run --rm ${GPU_FLAG} \
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               $MODEL_MOUNT \
               -v "${{ github.workspace }}:/workspace" -w /workspace \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
+              -e AITER_USE_SYSTEM_TRITON=1 \
               ${{ matrix.extra_env_args }} \
               ${{ env.BASE_IMAGE }} bash -lc "
                 set -euo pipefail
@@ -219,8 +263,12 @@ jobs:
                   exit 1
                 fi
                 ls -lh /workspace/aiter_wheels
+                echo \"AITER_USE_SYSTEM_TRITON=1; keeping system Triton\"
+                pip show triton
                 pip uninstall -y aiter amd-aiter || true
-                pip install --no-deps \"\${wheels[0]}\"
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip install \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
                 if [ -d \"/models/${{ matrix.model }}\" ]; then
                   model_path=\"/models/${{ matrix.model }}\"

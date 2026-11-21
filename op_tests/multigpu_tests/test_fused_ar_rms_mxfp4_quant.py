@@ -1,0 +1,590 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Unit test for fused AllReduce + RMSNorm + MXFP4 quantization.
+
+Two coverage modes:
+
+* CI smoke (default, ~2 min): runs ``CI_SHAPES`` (one shape per dispatch
+  path -- 1-stage, 2-stage, fallback) at ``stage=auto`` /
+  ``emit_bf16=False``, sweeping ``tp_size in [2, 4, 8]`` so every
+  production TP is covered. Every case runs with and without ``gemma_norm``,
+  and once more each with ``hadamard_rotate`` (bf16 side output on). Picked up automatically by
+  ``.github/scripts/aiter_test.sh`` which executes every multi-GPU test
+  with no flags. Pass ``-t N`` to restrict to a single TP for debugging.
+* Local full sweep (~50 min across TP=2/4/8): ``--full`` runs
+  ``FULL_SHAPES`` x stage=both x emit_bf16=[False, True], i.e. forces
+  both 1-stage and 2-stage kernels through every shape they support
+  in addition to the user-facing dispatcher path. ``--full`` also
+  sweeps ``tp_size in [2, 4, 8]`` unless ``-t N`` is set.
+
+Examples:
+    # CI invocation (no flags), sweeps TP in [2, 4, 8]:
+    python op_tests/multigpu_tests/test_fused_ar_rms_mxfp4_quant.py
+
+    # CI smoke at a single TP (debug):
+    python op_tests/multigpu_tests/test_fused_ar_rms_mxfp4_quant.py -t 8
+
+    # Local dense sweep, all TPs:
+    python op_tests/multigpu_tests/test_fused_ar_rms_mxfp4_quant.py --full
+
+    # Single-shape single-mode debug:
+    python op_tests/multigpu_tests/test_fused_ar_rms_mxfp4_quant.py \\
+        -t 4 -s 36,7168 --stage 2stage --emit-bf16
+"""
+
+import argparse
+import itertools
+import logging
+import os
+from multiprocessing import Pool, freeze_support, set_start_method
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from aiter import dtypes
+from aiter.dist.device_communicators.custom_all_reduce import (
+    _validate_mxfp4_hidden_dim,
+)
+from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import checkAllclose
+from aiter.utility.fp4_utils import mxfp4_to_f32
+
+set_start_method("spawn", force=True)
+
+logger = logging.getLogger("aiter")
+
+
+def barrier_before_teardown():
+    """Align all ranks before tearing down the distributed groups.
+
+    Drain this rank's GPU work, then join a barrier so no rank starts freeing
+    IPC buffers / destroying process groups while a peer is still inside a
+    NCCL / custom-all-reduce collective -- that race intermittently hangs when
+    these comm UTs run back-to-back in CI. No-op if dist is uninitialized.
+    """
+    if not dist.is_initialized():
+        return
+    torch.cuda.synchronize()
+    get_tp_group().barrier()
+    torch.cuda.synchronize()
+
+
+def _shape_arg(value: str) -> tuple[int, int]:
+    m, n = value.split(",")
+    return int(m), int(n)
+
+
+def _dequant_mxfp4(x_fp4: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    x = mxfp4_to_f32(x_fp4).view(x_fp4.shape[0], -1)
+    scale_u8 = scale if scale.dtype == torch.uint8 else scale.view(torch.uint8)
+    scale_f32 = torch.exp2(scale_u8.to(torch.float32) - 127).repeat_interleave(
+        32, dim=-1
+    )
+    return x * scale_f32
+
+
+def test_mxfp4_hidden_dim_validation_python_check():
+    for n in (32, 512, 4096, 6144, 7168, 8192, 16384):
+        _validate_mxfp4_hidden_dim(n, element_size=2)
+
+    for bad_n in (0, 1, 31, 33, 4097):
+        try:
+            _validate_mxfp4_hidden_dim(bad_n, element_size=2)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for n={bad_n}")
+
+    for bad_element_size in (0, -2, 3, 5):
+        try:
+            _validate_mxfp4_hidden_dim(4096, element_size=bad_element_size)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for element_size={bad_element_size}"
+            )
+
+
+def _run_mxfp4_case(
+    tp_size: int,
+    rank: int,
+    case_idx: int,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+    eps: float,
+    emit_bf16: bool,
+    stage_override: str | None,
+    gemma_norm: bool,
+    hadamard_rotate: bool,
+):
+    """Run one fused AR+RMSNorm+MXFP4 case on an initialized rank.
+
+    Every rank feeds the same ``x`` / ``residual`` / ``weight`` (seeded by
+    ``case_idx``), so the reduced sum is ``x * tp_size`` and the reference is
+    built here on the device. Only errors and shape tuples go back to the
+    parent, which asserts them.
+    """
+    from aiter.dist.communication_op import (
+        tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+    )
+    from aiter.ops.quant import per_1x32_f4_quant_hip
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    x = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    residual = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
+    weight = torch.randn((shape[-1],), dtype=dtype, device="cuda", generator=gen)
+    ref_residual = x * tp_size + residual
+    if gemma_norm:
+        # Gemma RMSNorm scales by (1 + w); the kernel adds the 1 after widening w.
+        ref = F.rms_norm(
+            ref_residual.float(), (shape[-1],), weight=weight.float() + 1.0, eps=eps
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
+    if hadamard_rotate:
+        ref_fp4, ref_scale = per_1x32_f4_quant_hip(ref, hadamard_rotate=True)
+    else:
+        ref_fp4, ref_scale = dynamic_mxfp4_quant(ref)
+    ref_dequant = _dequant_mxfp4(ref_fp4, ref_scale)
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        x,
+        residual,
+        weight,
+        eps,
+        quant_type="mxfp4",
+        emit_bf16=emit_bf16,
+        gemma_norm=gemma_norm,
+        hadamard_rotate=hadamard_rotate,
+    )
+    end.record()
+    torch.cuda.synchronize()
+    us = start.elapsed_time(end) * 1000.0
+    if emit_bf16:
+        out_fp4, res_out, scale, bf16_out = result
+    else:
+        out_fp4, res_out, scale = result
+        bf16_out = None
+
+    shapes_match = out_fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
+    out_dequant = _dequant_mxfp4(out_fp4, scale) if shapes_match else None
+    dequant_err = (
+        checkAllclose(
+            ref_dequant,
+            out_dequant,
+            msg=f"mxfp4 dequant {shape=} {gemma_norm=} {emit_bf16=} "
+            f"{stage_override=} rank={rank} {us:.2f}us",
+            atol=1.5,
+            rtol=5e-1,
+        )
+        if shapes_match
+        else float("inf")
+    )
+    # The elementwise tolerance above has to absorb FP4 rounding flips, so it
+    # cannot tell a wrong norm weight apart; the mean error can.
+    dequant_rel_l1 = (
+        ((out_dequant - ref_dequant).abs().mean() / ref_dequant.abs().mean()).item()
+        if shapes_match
+        else float("inf")
+    )
+    residual_err = checkAllclose(
+        ref_residual,
+        res_out,
+        msg=f"residual output {shape=} {gemma_norm=} {emit_bf16=} "
+        f"{stage_override=} rank={rank} {us:.2f}us",
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    # The rotated epilogue must quantize the kernel's own normed output exactly as
+    # the standalone rotated quant does.
+    rotated_exact = None
+    if hadamard_rotate and bf16_out is not None:
+        want_fp4, want_scale = per_1x32_f4_quant_hip(bf16_out, hadamard_rotate=True)
+        rotated_exact = torch.equal(
+            out_fp4.view(torch.uint8), want_fp4.view(torch.uint8)
+        ) and torch.equal(scale.view(torch.uint8), want_scale.view(torch.uint8))
+    bf16_err = 0.0
+    if bf16_out is not None:
+        bf16_err = checkAllclose(
+            ref,
+            bf16_out,
+            msg=f"bf16 side output {shape=} {gemma_norm=} {stage_override=} "
+            f"rank={rank} {us:.2f}us",
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    return {
+        "us": us,
+        "fp4_shape": (tuple(out_fp4.shape), tuple(ref_fp4.shape)),
+        "scale_shape": (tuple(scale.shape), tuple(ref_scale.shape)),
+        "has_bf16_out": bf16_out is not None,
+        "dequant_err": dequant_err,
+        "dequant_rel_l1": dequant_rel_l1,
+        "residual_err": residual_err,
+        "bf16_err": bf16_err,
+        "rotated_exact": rotated_exact,
+    }
+
+
+def _mxfp4_sweep(
+    tp_size: int,
+    rank: int,
+    cases: list[dict],
+    dtype: torch.dtype,
+    eps: float,
+    distributed_init_method: str,
+    stage_override: str | None = None,
+):
+    """Run every case on one rank inside a single distributed init.
+
+    ``AITER_AR_1STAGE`` is read once when the communicator module is imported,
+    so all cases of one sweep share one ``stage_override``. Results are
+    returned rather than asserted here: every rank must walk the full case
+    list so the collectives stay aligned across ranks.
+    """
+    if stage_override is not None:
+        os.environ["AITER_AR_1STAGE"] = stage_override
+    elif "AITER_AR_1STAGE" in os.environ:
+        del os.environ["AITER_AR_1STAGE"]
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp_size,
+        rank=rank,
+        distributed_init_method=distributed_init_method,
+    )
+    ensure_model_parallel_initialized(tp_size, 1)
+
+    group = get_tp_group().device_group
+    dist.all_reduce(torch.zeros(1, device=device), group=group)
+    torch.cuda.synchronize()
+
+    results = [
+        _run_mxfp4_case(
+            tp_size,
+            rank,
+            case_idx,
+            case["shape"],
+            dtype,
+            eps,
+            case["emit_bf16"],
+            stage_override,
+            case["gemma_norm"],
+            case["hadamard_rotate"],
+        )
+        for case_idx, case in enumerate(cases)
+    ]
+
+    barrier_before_teardown()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    torch.cuda.empty_cache()
+    return results
+
+
+def _expected_path(
+    shape: tuple[int, int],
+    tp_size: int,
+    element_size: int,
+    stage_override: str | None,
+    emit_bf16: bool,
+) -> str:
+    """Mirror CudaCommunicator.fused_allreduce_rmsnorm_mxfp4_quant gating."""
+    M, K = shape
+    total_bytes = M * K * element_size
+    pack_size = 16 // element_size if element_size > 0 else 0
+    block_size = K // pack_size if pack_size > 0 else 0
+    use_direct_mxfp4 = (
+        M <= 4
+        or (K <= 4096 and M <= 32)
+        or (K <= 6144 and M <= 16)
+        or (K == 8192 and M <= 8)
+    )
+    can_1stage = (
+        stage_override != "0"
+        and K % 32 == 0
+        and K <= 16384
+        and M <= 80
+        and use_direct_mxfp4
+    )
+    can_2stage = (
+        stage_override != "1"
+        and K % 32 == 0
+        and pack_size > 0
+        and K <= 8192
+        and block_size % tp_size == 0
+        and (not emit_bf16 or block_size % 32 == 0)
+        and total_bytes <= 512 * 1024
+    )
+    if stage_override is None:
+        prefer_2stage = can_2stage and tp_size == 8 and M >= 16 and K <= 6144
+        if prefer_2stage:
+            can_1stage = False
+    if can_1stage:
+        return "direct_1stage"
+    if can_2stage:
+        return "direct_2stage"
+    return "fallback"
+
+
+def test_fused_ar_rmsnorm_mxfp4_quant(
+    tp_size: int,
+    cases: list[dict],
+    dtype: torch.dtype,
+    stage_override: str | None = None,
+):
+    """Run ``cases`` on one TP group and return one summary row per case."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "49383"
+    distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
+    eps = 1e-6
+    with Pool(processes=tp_size) as pool:
+        futures = [
+            pool.apply_async(
+                _mxfp4_sweep,
+                args=(
+                    tp_size,
+                    rank,
+                    cases,
+                    dtype,
+                    eps,
+                    distributed_init_method,
+                    stage_override,
+                ),
+            )
+            for rank in range(tp_size)
+        ]
+        per_rank = [future.get() for future in futures]
+
+    element_size = torch.tensor([], dtype=dtype).element_size()
+    rows = []
+    for i, case in enumerate(cases):
+        shape, emit_bf16 = case["shape"], case["emit_bf16"]
+        gemma_norm = case["gemma_norm"]
+        hadamard_rotate = case["hadamard_rotate"]
+        results = [rank_results[i] for rank_results in per_rank]
+        for r in results:
+            out_shape, ref_shape = r["fp4_shape"]
+            assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
+            out_shape, ref_shape = r["scale_shape"]
+            assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
+            assert r["dequant_rel_l1"] < 0.05, (
+                f"mxfp4 dequant rel L1 {r['dequant_rel_l1']:.4f} "
+                f"{shape=} {gemma_norm=} {emit_bf16=} {stage_override=}"
+            )
+            if emit_bf16:
+                assert r["has_bf16_out"]
+            if hadamard_rotate:
+                assert r["rotated_exact"], (
+                    f"rotated MXFP4 differs from per_1x32_f4_quant_hip "
+                    f"{shape=} {stage_override=}"
+                )
+        expected_path = _expected_path(
+            shape, tp_size, element_size, stage_override, emit_bf16
+        )
+        rows.append(
+            {
+                "shape": shape,
+                "tp_size": tp_size,
+                "dtype": str(dtype).replace("torch.", ""),
+                "emit_bf16": emit_bf16,
+                "gemma_norm": gemma_norm,
+                "hadamard_rotate": hadamard_rotate,
+                "stage_override": stage_override or "auto",
+                "expected_path": expected_path,
+                "min_us": min(r["us"] for r in results),
+                "max_us": max(r["us"] for r in results),
+                "mxfp4_dequant_err": max(r["dequant_err"] for r in results),
+                "mxfp4_dequant_rel_l1": max(r["dequant_rel_l1"] for r in results),
+                "residual_err": max(r["residual_err"] for r in results),
+                "bf16_err": max(r["bf16_err"] for r in results),
+            }
+        )
+    return rows
+
+
+# Mix of decode-sized (1-stage), prefill-sized within the 512 KiB 2-stage
+# budget, and an oversized shape that should fall back to fused
+# AR+RMSNorm + dynamic_mxfp4_quant.
+CI_SHAPES = [
+    # Covers all three dispatch paths at the default --tp-size 8:
+    (1, 4096),  # direct_1stage (K<=4096 -> M<=32 at TP=8)
+    (16, 7168),  # direct_2stage (16*7168*2 = 224 KiB <= 512 KiB; 7168%8 == 0)
+    (128, 7168),  # fallback (1.75 MiB exceeds the 2-stage 512 KiB budget)
+]
+
+FULL_SHAPES = [
+    (1, 4096),  # 1-stage
+    (8, 7168),  # 1-stage
+    (32, 7168),  # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
+    (56, 7168),  # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
+    (16, 4096),  # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
+    (8, 8192),  # 1-stage (K == 8192 -> M <= 8)
+    (32, 8192),  # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
+    (64, 7168),  # fallback (64*7168*2 = 896 KiB > 512 KiB)
+    (128, 7168),  # fallback
+]
+
+DEFAULT_SHAPES = CI_SHAPES
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Test fused AR+RMSNorm+MXFP4 quantization"
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=["fp16", "bf16"],
+        default="bf16",
+    )
+    parser.add_argument(
+        "-t",
+        "--tp-size",
+        type=int,
+        default=None,
+        help=(
+            "Tensor-parallel world size. When unset, the test sweeps "
+            "tp_size in [2, 4, 8] so the CI smoke covers every production "
+            "TP. Set explicitly (e.g. -t 8) for single-TP debugging."
+        ),
+    )
+    parser.add_argument(
+        "-s",
+        "--shape",
+        type=_shape_arg,
+        nargs="*",
+        default=None,
+        help="shape(s), e.g. -s 1,4096 8,7168 32,7168",
+    )
+    parser.add_argument(
+        "--emit-bf16",
+        action="store_true",
+        help=(
+            "Also exercise the bf16 side-output path. Default (CI smoke) only "
+            "runs emit_bf16=False; --full implies both."
+        ),
+    )
+    parser.add_argument(
+        "--stage",
+        choices=["auto", "1stage", "2stage", "both"],
+        default="auto",
+        help=(
+            "Which kernel variant(s) to exercise. 'auto' (default, CI smoke) "
+            "runs only the user-facing dispatcher path. 'both' additionally "
+            "forces 1-stage and 2-stage via AITER_AR_1STAGE; --full implies "
+            "'both'."
+        ),
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Run the dense local coverage matrix: FULL_SHAPES x stage=both x "
+            "emit_bf16=[False, True]. Intended for local validation; the CI "
+            "lane keeps the smoke defaults (CI_SHAPES x stage=auto x "
+            "emit_bf16=False) to stay under ~1 minute. Both lanes run every "
+            "case with and without gemma_norm."
+        ),
+    )
+    parser.add_argument(
+        "--skip-python-check",
+        action="store_true",
+        help="Skip the non-distributed hidden-dim validation test.",
+    )
+    args = parser.parse_args()
+
+    if not args.skip_python_check:
+        test_mxfp4_hidden_dim_validation_python_check()
+
+    dtype = dtypes.d_dtypes[args.dtype]
+
+    if args.full:
+        shapes = args.shape if args.shape is not None else FULL_SHAPES
+        emit_bf16_values = [False, True]
+        stage_overrides = [None, "1", "0"]
+    else:
+        shapes = args.shape if args.shape is not None else DEFAULT_SHAPES
+        emit_bf16_values = [False, True] if args.emit_bf16 else [False]
+        stage_to_env = {"auto": None, "1stage": "1", "2stage": "0"}
+        if args.stage == "both":
+            stage_overrides = [None, "1", "0"]
+        else:
+            stage_overrides = [stage_to_env[args.stage]]
+
+    # Every lane covers the Gemma (1 + w) weight path as well as the plain one.
+    gemma_norm_values = [False, True]
+    tp_sizes = [args.tp_size] if args.tp_size is not None else [2, 4, 8]
+    element_size = torch.tensor([], dtype=dtype).element_size()
+
+    # One TP group per (tp_size, stage_override): AITER_AR_1STAGE is fixed per
+    # process, while shapes and emit_bf16 are swept inside the group.
+    rows = []
+    for tp_size, stage_override in itertools.product(tp_sizes, stage_overrides):
+        cases = [
+            {
+                "shape": shape,
+                "emit_bf16": emit_bf16,
+                "gemma_norm": gemma_norm,
+                "hadamard_rotate": False,
+            }
+            for shape, emit_bf16, gemma_norm in itertools.product(
+                shapes, emit_bf16_values, gemma_norm_values
+            )
+        ] + [
+            {
+                "shape": shape,
+                "emit_bf16": True,
+                "gemma_norm": gemma_norm,
+                "hadamard_rotate": True,
+            }
+            # The rotated quant needs the gfx950 hardware FP4 convert.
+            for shape, gemma_norm in itertools.product(
+                shapes if get_gfx() == "gfx950" else [], gemma_norm_values
+            )
+        ]
+        # When forcing a specific kernel, only exercise shapes that the
+        # kernel actually supports. Fallbacks under override would just
+        # silently re-test the unfused reference path.
+        cases = [
+            case
+            for case in cases
+            if stage_override is None
+            or _expected_path(
+                case["shape"], tp_size, element_size, stage_override, case["emit_bf16"]
+            )
+            != "fallback"
+        ]
+        if cases:
+            rows.extend(
+                test_fused_ar_rmsnorm_mxfp4_quant(
+                    tp_size, cases, dtype, stage_override=stage_override
+                )
+            )
+
+    for row in rows:
+        logger.info("fused AR+RMSNorm+MXFP4 row: %s", row)
+
+
+if __name__ == "__main__":
+    freeze_support()
+    main()

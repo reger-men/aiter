@@ -27,6 +27,7 @@ if get_gfx() != "gfx950":
 
 import torch
 import torch.nn.functional as F
+
 from aiter import dtypes
 from aiter.test_common import checkAllclose
 
@@ -61,7 +62,7 @@ def run_cktile_tune(x, weight, x_scale, w_scale, kernel_id, dtype=dtypes.bf16):
     """Invoke a specific CKTile kernel by ID via the tune entry point."""
     from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_cktile_tune
 
-    m, k = x.shape
+    m, _k = x.shape
     n = weight.shape[0]
     Y = torch.empty(m, n, dtype=dtype, device=x.device)
     return gemm_a8w8_blockscale_cktile_tune(
@@ -208,14 +209,18 @@ def test_accuracy(m, n, k, dtype=dtypes.bf16, err_threshold=0.05):
 
     print(f"  Testing ColumnMajor kernel {cm_kid} ({cm_inst.name})")
     out_cm = run_cktile_tune(x, weight, x_scale, w_scale, cm_kid, dtype)
-    err_cm = checkAllclose(ref, out_cm, msg=f"ColMajor(id={cm_kid})")
+    err_cm = checkAllclose(
+        ref, out_cm, msg=f"ColMajor(id={cm_kid})", catastrophic_check=True
+    )
 
     print(f"  Testing RowMajor kernel {rm_kid} ({rm_inst.name})")
     out_rm = run_cktile_tune(x, weight, x_scale, w_scale, rm_kid, dtype)
-    err_rm = checkAllclose(ref, out_rm, msg=f"RowMajor(id={rm_kid})")
+    err_rm = checkAllclose(
+        ref, out_rm, msg=f"RowMajor(id={rm_kid})", catastrophic_check=True
+    )
 
     # Also check that both outputs are close to each other
-    checkAllclose(out_cm, out_rm, msg="ColMajor vs RowMajor")
+    checkAllclose(out_cm, out_rm, msg="ColMajor vs RowMajor", catastrophic_check=True)
 
     print(f"  PASSED: shape ({m},{n},{k}) " f"cm_err={err_cm:.4f} rm_err={err_rm:.4f}")
 
@@ -262,7 +267,9 @@ def test_padded_weight_stride(m, n, k, dtype=dtypes.bf16):
         return
 
     out = run_cktile_tune(x, weight_padded, x_scale, w_scale, rm_kid, dtype)
-    err = checkAllclose(ref, out, msg=f"PaddedWeight+RowMajor(id={rm_kid})")
+    err = checkAllclose(
+        ref, out, msg=f"PaddedWeight+RowMajor(id={rm_kid})", catastrophic_check=True
+    )
     print(f"  PASSED: padded weight shape ({m},{n},{k}) err={err:.4f}")
 
 

@@ -25,14 +25,14 @@ Notation (from mHC paper arXiv:2512.24880v2):
 import torch
 
 __all__ = [
+    "generate_mhc_inputs",
+    "generate_mhc_post_inputs",
+    "get_test_shapes",
+    "is_doubly_stochastic",
+    "mhc_post_torch",
     "mhc_torch",
     "sinkhorn_knopp_exp_domain_torch",
     "sinkhorn_knopp_log_domain_torch",
-    "is_doubly_stochastic",
-    "generate_mhc_inputs",
-    "get_test_shapes",
-    "mhc_post_torch",
-    "generate_mhc_post_inputs",
 ]
 
 # =============================================================================
@@ -52,6 +52,8 @@ def mhc_torch(
     hc_pre_eps: float = 0.0,
     sinkhorn_iters: int = 20,
     return_with_sinkhorn: bool = True,
+    asymmetric_exp_domain: bool = False,
+    hc_sinkhorn_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Single PyTorch reference for mHC (Eq 14-19) plus the apply-pre fusion step,
@@ -89,6 +91,15 @@ def mhc_torch(
         return_with_sinkhorn: if True, apply Sinkhorn-Knopp to H_res; else
             return raw H^res logits as ``hres`` (matches ``mhc(..., sinkhorn_iters=0)``
             which skips Eq 19).
+        asymmetric_exp_domain: select the Sinkhorn variant matching Triton
+            ``mhc_post_pre(..., asymmetric_exp_domain=...)``. When False
+            (default), uses canonical log-domain Sinkhorn-Knopp. When True,
+            uses the HIP-compatible asymmetric exp-domain variant (first iter
+            ``softmax(row) + eps`` then ``div(col + eps)``, followed by
+            ``sinkhorn_iters - 1`` symmetric ``div(row + eps)/div(col + eps)``
+            iters); see ``sinkhorn_knopp_asymmetric_exp_domain_torch``.
+        hc_sinkhorn_eps: eps used by the asymmetric exp-domain Sinkhorn;
+            ignored when ``asymmetric_exp_domain`` is False.
 
     Returns:
         Tuple ``(hpost, hres, hpre, layer_input)`` all in fp32:
@@ -144,7 +155,12 @@ def mhc_torch(
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint.
     H_res_3d = H_res.view(M, n, n)
     if return_with_sinkhorn:
-        hres = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=sinkhorn_iters)
+        if asymmetric_exp_domain:
+            hres = sinkhorn_knopp_asymmetric_exp_domain_torch(
+                H_res_3d, num_iters=sinkhorn_iters, eps=hc_sinkhorn_eps
+            )
+        else:
+            hres = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=sinkhorn_iters)
     else:
         hres = H_res_3d  # already fp32
 
@@ -162,7 +178,7 @@ def sinkhorn_knopp_exp_domain_torch(
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
     """
-    M, N, _ = logits.shape
+    _M, _N, _ = logits.shape
 
     A = logits.to(torch.float32)
 
@@ -179,6 +195,61 @@ def sinkhorn_knopp_exp_domain_torch(
         # Column normalization: make each column sum to 1
         col_sums = P.sum(dim=-2, keepdim=True)  # (M, 1, N)
         P = P / (col_sums + eps)
+
+    return P.to(logits.dtype)
+
+
+def sinkhorn_knopp_asymmetric_exp_domain_torch(
+    logits: torch.Tensor,
+    num_iters: int = 20,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """HIP-compatible asymmetric exp-domain Sinkhorn-Knopp reference.
+
+    Bit-for-bit mirror of the Triton ``ASYMMETRIC_EXP_DOMAIN`` branch
+    (``_triton_kernels/fusions/mhc.py``: ``_mhc_post_pre_reduce_apply_res_block``)
+    and the HIP kernel (``csrc/kernels/mhc_kernels.cu``):
+
+      - First iteration is asymmetric: ``P = softmax_row(logits)`` (i.e.
+        ``exp(x - row_max) / row_sum``) then ``+ eps``, followed by
+        ``P /= (col_sum + eps)``.
+      - The remaining ``num_iters - 1`` iterations are symmetric:
+        ``P /= (row_sum + eps)`` then ``P /= (col_sum + eps)``.
+
+    Row direction is the last dim (sum over columns of a row); column
+    direction is dim ``-2`` (sum over rows of a column), matching the kernels'
+    ``axis=2`` / ``axis=1`` reductions on the ``(M, n, n)`` tile.
+
+    Args:
+        logits: (M, N, N) raw H^res logits.
+        num_iters: total Sinkhorn iterations (>= 1 expected; ``0`` returns the
+            softmax-free input unchanged, matching the kernels' skip path).
+        eps: ``hc_sinkhorn_eps`` perturbation.
+
+    Returns:
+        (M, N, N) tensor cast back to ``logits.dtype``.
+    """
+    num_iters = int(num_iters)
+    if num_iters <= 0:
+        return logits
+
+    A = logits.to(torch.float32)
+
+    # First iter (asymmetric): softmax over the row (last dim) + eps, then
+    # divide by (col_sum + eps).
+    row_max = A.amax(dim=-1, keepdim=True)  # (M, N, 1)
+    P = torch.exp(A - row_max)
+    row_sum = P.sum(dim=-1, keepdim=True)  # (M, N, 1)
+    P = P / row_sum + eps
+    col_sum = P.sum(dim=-2, keepdim=True)  # (M, 1, N)
+    P = P / (col_sum + eps)
+
+    # Remaining iters (symmetric): div(row + eps) then div(col + eps).
+    for _ in range(num_iters - 1):
+        row_sum = P.sum(dim=-1, keepdim=True)
+        P = P / (row_sum + eps)
+        col_sum = P.sum(dim=-2, keepdim=True)
+        P = P / (col_sum + eps)
 
     return P.to(logits.dtype)
 
@@ -240,10 +311,7 @@ def is_doubly_stochastic(P: torch.Tensor, tol: float = 1e-3) -> bool:
 
     # Check column sums ≈ 1
     col_sums = P.sum(dim=-2)  # (M, N)
-    if not torch.allclose(col_sums, torch.ones_like(col_sums), atol=tol):
-        return False
-
-    return True
+    return torch.allclose(col_sums, torch.ones_like(col_sums), atol=tol)
 
 
 # =============================================================================
@@ -286,9 +354,9 @@ def generate_mhc_inputs(
     phi = torch.randn(nC, N_total, dtype=dtype, device=device) * 0.1
 
     # scaling factors (Eq 12)
-    alpha_pre = 0.5 + torch.rand(1).item()
-    alpha_post = 0.5 + torch.rand(1).item()
-    alpha_res = 0.5 + torch.rand(1).item()
+    alpha_pre = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
+    alpha_post = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
+    alpha_res = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
 
     # bias (Eq 13)
     bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1

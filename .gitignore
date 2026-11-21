@@ -17,10 +17,19 @@ aiter/install_mode
 *.gch
 *.pch
 
+# Local Claude Code settings (per-user, not for VCS). Scoped to everything BUT the skills:
+# `.claude/` ignored wholesale also silences `git add` for NEW files under
+# .claude/skills/, which are version-controlled -- a file could be written, committed and
+# pushed without ever entering the repository, in silence.
+.claude/*
+!.claude/skills/
+
 # Compiled Dynamic libraries
 *.so
+*.so.*
 *.dylib
 *.dll
+*.pyd
 build
 blob
 
@@ -77,6 +86,10 @@ OUT_FOLDER/
 op_tests/moe_benchmarking_profiling/results/*.csv
 scripts/results/*.csv
 
+# Opus tuned/untuned CSVs (moved to aiter/configs/bf16_tuned_gemm.csv with libtype='opus' filter;
+# autolog feature removed). Reject any re-introduction under aiter/ops/opus/configs/.
+aiter/ops/opus/configs/
+
 # Jupyter notebook checkpoints and outputs
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
@@ -84,3 +97,17 @@ scripts/results/*.csv
 # vim swaps
 *.swo
 *.swp
+
+# Debug assembly dumps from csrc/opus_gemm/gen_co/build_co.py. The .co files
+# next to them ARE tracked (the wheel needs them); these are just for analysis.
+csrc/opus_gemm/gen_co/**/asm/
+
+# Backstop for local runs of .github/scripts/update_split_test_times.py, whose
+# --summary-path still defaults to the working directory. The workflow itself
+# now writes both files to the runner temp dir and limits what its bot may
+# commit, after copies of them reached the repo root in #5131.
+/pr-body.md
+/split-tests-update-summary.md
+
+# Merge-conflict backups, which git writes next to the file being merged.
+*.orig
